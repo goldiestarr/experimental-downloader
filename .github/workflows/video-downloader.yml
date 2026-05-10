@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       youtube_url:
-        description: '🔗 YouTube video URL(s) (separate multiple URLs with spaces)'
+        description: '🔗 YouTube video URL(s)'
         required: true
         type: string
       quality:
@@ -38,210 +38,148 @@ jobs:
           persist-credentials: true
           fetch-depth: 0
 
-      - name: Setup FFmpeg and yt-dlp
-        run: |
-          # Install dependencies
-          sudo apt-get update
-          sudo apt-get install -y python3-pip ffmpeg zip
-          
-          # Install yt-dlp
-          pip install --upgrade yt-dlp
-          
-          # Verify installations
-          ffmpeg -version | head -n 1
-          yt-dlp --version
-
       - name: Prepare videos branch
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          
-          # Fetch all branches
-          git fetch --all
-          
-          # Check if videos branch exists
-          if git show-ref --verify --quiet refs/heads/videos; then
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git fetch origin
+
+          if git ls-remote --exit-code --heads origin videos; then
             git checkout videos
-            git pull origin videos --no-rebase
+            git pull origin videos
           else
-            # Create orphan branch if it doesn't exist
             git checkout --orphan videos
             git rm -rf . || true
             mkdir -p videos
-            echo "# Video Storage" > README.md
-            echo "This branch stores downloaded videos." >> README.md
-            git add README.md
-            git commit -m "Initialize videos branch"
-            git push -u origin videos
+            git commit --allow-empty -m "[bot] Initialize videos branch"
+            git push --set-upstream origin videos
           fi
 
+      - name: Setup FFmpeg
+        run: |
+          wget https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz
+          tar -xf ffmpeg-master-latest-linux64-gpl.tar.xz
+          sudo mv ffmpeg-master-latest-linux64-gpl/bin/ffmpeg /usr/local/bin/
+          sudo mv ffmpeg-master-latest-linux64-gpl/bin/ffprobe /usr/local/bin/
+          ffmpeg -version
+
+      - name: Setup yt-dlp & WARP
+        run: |
+          sudo apt-get install -y python3-pip curl
+          
+          # install deno
+          curl -fsSL https://deno.land/install.sh | sh
+          export DENO_INSTALL="$HOME/.deno"
+          export PATH="$DENO_INSTALL/bin:$PATH"
+          echo "$DENO_INSTALL/bin" >> $GITHUB_PATH
+          deno --version
+          
+          # install yt-dlp
+          pip install yt-dlp
+
+          # start WARP (thanks to https://avasam.ir ❤️‍🔥)
+          docker network create warp-net || true
+          docker run -d \
+            --name warp \
+            --restart=always \
+            --network warp-net \
+            -p 1080:1080 \
+            --cap-add NET_ADMIN \
+            --sysctl net.ipv6.conf.all.disable_ipv6=0 \
+            --sysctl net.ipv4.conf.all.src_valid_mark=1 \
+            -v warp-data:/var/lib/cloudflare-warp \
+            caomingjun/warp
+
+          # Waiting for WARP to initialize (15 seconds)...
+          sleep 15
+
+          # Checking WARP status...
+          for i in {1..5}; do
+            RESULT=$(curl -s --max-time 5 --socks5-hostname 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace 2>/dev/null || echo "failed")
+            if echo "$RESULT" | grep -qE "warp=(on|plus)"; then
+              echo "WARP is active!"
+              echo "$RESULT"
+              break
+            else
+              echo "Attempt $i/5 - WARP not ready yet, waiting..."
+              sleep 5
+            fi
+          done
+
+          FINAL=$(curl -s --max-time 10 --socks5-hostname 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace 2>/dev/null || echo "failed")
+          if echo "$FINAL" | grep -qE "warp=(on|plus)"; then
+            echo "WARP proxy is ready!"
+          else
+            echo "WARP might not be fully active, but continuing anyway..."
+            echo "Response: $FINAL"
+          fi
+          
       - name: Download videos
         id: download
         run: |
-          # Create temporary directory
-          mkdir -p tmpvideos
-          cd tmpvideos
-          
-          # Parse quality settings
+          # parse quality input
           QUALITY="${{ inputs.quality }}"
           
           if [ "$QUALITY" = "audio" ]; then
-            FORMAT_OPTS="-f bestaudio --extract-audio --audio-format mp3 --audio-quality 0"
-            EXTENSION="mp3"
+            FORMAT_OPTS="-f bestaudio --extract-audio --audio-format mp3"
           elif [ "$QUALITY" = "best" ]; then
             FORMAT_OPTS="-f bestvideo+bestaudio/best --merge-output-format mp4"
-            EXTENSION="mp4"
           else
-            FORMAT_OPTS="-f \"bestvideo[height<=${QUALITY}]+bestaudio/best[height<=${QUALITY}]\" --merge-output-format mp4"
-            EXTENSION="mp4"
+            FORMAT_OPTS="-f bestvideo[height<=${QUALITY}]+bestaudio/best[height<=${QUALITY}] --merge-output-format mp4"
           fi
-          
-          # Parse output name
+
+          # parse output name
           OUTPUT_NAME="${{ inputs.output_name }}"
           if [ -n "$OUTPUT_NAME" ]; then
-            OUTPUT_OPTS="-o \"${OUTPUT_NAME}.%(ext)s\""
+            OUTPUT_OPTS="-o ${OUTPUT_NAME}.%(ext)s"
           else
-            OUTPUT_OPTS="-o \"%(title)s.%(ext)s\""
+            OUTPUT_OPTS=""
           fi
           
-          # Handle multiple URLs
-          echo "Downloading videos..."
-          IFS=' ' read -ra URLS <<< "${{ inputs.youtube_url }}"
-          
-          for url in "${URLS[@]}"; do
-            echo "Downloading: $url"
-            eval yt-dlp $FORMAT_OPTS $OUTPUT_OPTS \
-              --no-playlist \
-              --restrict-filenames \
-              --progress \
-              --no-mtime \
-              "$url"
-          done
-          
-          # List downloaded files
-          echo "Downloaded files:"
+          # download using yt-dlp
+          mkdir -p tmpvideos
+          cd tmpvideos
+          yt-dlp --remote-components ejs:github --proxy "socks5://127.0.0.1:1080" $FORMAT_OPTS $OUTPUT_OPTS "${{ inputs.youtube_url }}"
+
+          # find name
+          FILE=$(ls -1 | head -n 1)
+          FILE_NO_EXTENSION="${FILE%.*}"
+          echo "FILE=$FILE" >> $GITHUB_ENV
+          echo "FILE_NO_EXTENSION=$FILE_NO_EXTENSION" >> $GITHUB_ENV
+          SAFE_NAME=$(echo "$FILE" | sed 's/^[[:space:]]*//' | tr ' ' '_')
+          echo "SAFE_NAME=$SAFE_NAME" >> $GITHUB_ENV
+
+          # zip
+          zip -s 45m "../videos/${SAFE_NAME}.zip" "$FILE"
           ls -la
           
-          # Get list of downloaded files for the next step
-          ls -1 > ../filelist.txt
-          
-          cd ..
+          # stop WARP
+          docker stop warp || true
+          docker rm warp || true
 
-      - name: Package and move videos
+      - name: Generate README with Download Links
         run: |
-          # Create videos directory if it doesn't exist
-          mkdir -p videos
+          rm -f README.md
           
-          # Process each downloaded file
-          while IFS= read -r file; do
-            if [ -f "tmpvideos/$file" ] && [ -n "$file" ]; then
-              # Clean filename for safe storage
-              safe_name=$(echo "$file" | sed 's/[^a-zA-Z0-9._-]/_/g')
-              
-              # For files larger than 45MB, split into parts
-              file_size=$(stat -c%s "tmpvideos/$file")
-              max_size=$((45 * 1024 * 1024)) # 45MB in bytes
-              
-              if [ $file_size -gt $max_size ]; then
-                echo "Splitting large file: $file (${file_size} bytes)"
-                cd tmpvideos
-                zip -s 45m "../videos/${safe_name}.zip" "$file"
-                cd ..
-              else
-                echo "Moving file: $file"
-                mv "tmpvideos/$file" "videos/${safe_name}"
-              fi
-            fi
-          done < filelist.txt
+          echo "# 📥 Download Links" > README.md
+          echo "Generated on: $(date)" >> README.md
+          echo "" >> README.md
           
-          # Clean up
-          rm -rf tmpvideos filelist.txt
-          
-          # List videos in storage
-          echo "Videos in storage:"
-          ls -la videos/
-
-      - name: Generate Download Links
-        run: |
-          cat > README.md << 'EOF'
-          # 📥 Video Download Links
-          
-          **Generated on:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')
-          
-          > Click on any link below to download your video file.
-          
-          ## Available Downloads
-          
-          EOF
-          
-          # Generate download links
+          # Loop through all files in the videos folder
           for file in videos/*; do
             if [ -f "$file" ]; then
               filename=$(basename "$file")
-              # URL encode the filename
-              encoded_filename=$(printf '%s' "$filename" | od -An -tx1 | tr ' ' % | sed 's/%%/%/g' | sed 's/%0a//g')
-              url="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/refs/heads/videos/videos/${encoded_filename}"
-              
-              # Get file size
-              file_size=$(stat -c%s "$file")
-              if [ $file_size -gt 1048576 ]; then
-                size_display="$((file_size / 1048576)) MB"
-              else
-                size_display="$((file_size / 1024)) KB"
-              fi
-              
-              echo "- [${filename}](${url}) - ${size_display}" >> README.md
+              # URL Encode spaces for the markdown link
+              encoded_filename=$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1]))" "$filename")
+              # Construct the raw link
+              url="https://github.com/${{ github.repository }}/raw/videos/videos/$encoded_filename"
+              echo "- [Download $filename]($url)" >> README.md
             fi
           done
           
-          # Add footer
-          cat >> README.md << 'EOF'
-          
-          ---
-          *Files will remain available in the \`videos\` branch of this repository.*
-          EOF
-          
-          echo "README.md generated:"
-          cat README.md
-
-      - name: Commit and push changes
+      - name: Commit
         run: |
-          # Switch to videos branch
-          git checkout videos
+          git add README.md videos
+          git commit -m "[bot] Add video ${{ env.SAFE_NAME }}"
+          git push
           
-          # Add all changes
-          git add README.md videos/
-          
-          # Check if there are changes to commit
-          if git diff --staged --quiet; then
-            echo "No changes to commit"
-          else
-            # Create commit message with timestamp
-            timestamp=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
-            git commit -m "[bot] Update videos - ${timestamp}"
-            
-            # Push to remote
-            git push origin videos
-            
-            echo "Changes pushed successfully"
-          fi
-          
-          # Switch back to main branch
-          git checkout main 2>/dev/null || true
-
-      - name: Summary
-        run: |
-          echo "## Download Complete 🎉" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Videos have been downloaded and stored in the \`videos\` branch.**" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Download Links" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          
-          # Add links to summary
-          for file in videos/*; do
-            if [ -f "$file" ]; then
-              filename=$(basename "$file")
-              echo "- [${filename}](https://github.com/${GITHUB_REPOSITORY}/blob/videos/videos/${filename})" >> $GITHUB_STEP_SUMMARY
-            fi
-          done        
